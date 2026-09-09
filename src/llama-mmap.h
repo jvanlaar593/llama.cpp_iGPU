@@ -46,8 +46,10 @@ struct llama_mmap {
     using ranges = std::vector<std::pair<size_t, size_t>>;
 
     llama_mmap(const llama_mmap &) = delete;
+    // writable maps copy-on-write instead of read-only, needed by backends that import the
+    // pages as device memory - drivers reject a read-only mapping
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1, bool numa = false,
-               const ranges & lazy_ranges = {});
+               const ranges & lazy_ranges = {}, bool writable = false);
     ~llama_mmap();
 
     size_t size() const;

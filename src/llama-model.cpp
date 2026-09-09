@@ -1702,7 +1702,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
-    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+    // an iGPU imports the mapping through its driver, which rejects read-only pages, so map
+    // copy-on-write instead. Host-side importers (CPU, BLAS) and Metal do not need this.
+    bool mapping_writable = false;
+    for (const auto & dev : devices) {
+        ggml_backend_dev_props props;
+        ggml_backend_dev_get_props(dev.dev, &props);
+        if (props.caps.buffer_from_host_ptr && props.type == GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            mapping_writable = true;
+            break;
+        }
+    }
+
+    ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr, mapping_writable);
     pimpl->mappings.reserve(ml.mappings.size());
 
     // create the backend buffers
@@ -1739,12 +1751,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         bool buffer_from_host_ptr_supported = props.caps.buffer_from_host_ptr;
         bool is_default_buft = buft == ggml_backend_dev_buffer_type(dev);
 
+        // the backend indexes mapped tensors in place, so the file offsets must meet its alignment.
+        // gguf pads tensor data to general.alignment (32 by default), which is less than some backends need
+        bool mapping_aligned = true;
+        if (buffer_from_host_ptr_supported && is_default_buft && !ml.no_alloc) {
+            const size_t buft_alignment = ggml_backend_buft_get_alignment(buft);
+            for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
+                if (!ml.mapping_is_aligned(buft_alignment, idx, ctx)) {
+                    mapping_aligned = false;
+                    break;
+                }
+            }
+        }
+
         std::vector<ggml_backend_buffer_ptr> bufs;
 
         // a lazy context is mapped whatever the load mode, but the memory-fit pass maps nothing
         const bool is_lazy_mapped = ctx_key.lazy && !ml.no_alloc;
 
-        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft) {
+        if ((ml.use_mmap || is_lazy_mapped) && use_mmap_buffer && buffer_from_host_ptr_supported && is_default_buft && mapping_aligned) {
             GGML_ASSERT(!ml.no_alloc);
             for (uint32_t idx = 0; idx < ml.files.size(); idx++) {
                 // only the mmap region containing the tensors in the model is mapped to the backend buffer

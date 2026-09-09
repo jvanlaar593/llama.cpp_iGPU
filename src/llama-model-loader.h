@@ -240,9 +240,12 @@ struct llama_model_loader {
 
     void done_getting_tensors(bool partial = false) const;
 
-    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
+    void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr, bool writable = false);
 
     void get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const;
+
+    // true if every mapped tensor in ctx starts at a multiple of alignment
+    bool mapping_is_aligned(size_t alignment, int idx, ggml_context * ctx) const;
 
     // release a weight's mmap pages
     void unmap_weight(const llama_tensor_weight & w) const;

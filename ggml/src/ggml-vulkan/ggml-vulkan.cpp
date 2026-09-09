@@ -2719,10 +2719,17 @@ template <> void init_pushconst_tensor_offsets(ggml_backend_vk_context * ctx, vk
     p.d_offset = get_misalign_bytes(ctx, dst)  / ggml_type_size(dst->type);
 }
 
+static void ggml_vk_host_unregister(vk_device& device, void * ptr);
+
 struct ggml_backend_vk_buffer_context {
     vk_device_ref device;
     vk_buffer dev_buffer;
     std::string name;
+
+    // host_ptr is the logical base of an imported host range (mmap-ed weights on UMA).
+    // The range can exceed the maximum buffer size, so it is imported as overlapping chunks.
+    void * host_ptr = nullptr;
+    std::vector<vk_buffer> host_buffers;
 
     ggml_backend_vk_buffer_context(vk_device_ref device, vk_buffer&& dev_buffer, std::string& name) :
         device(device),
@@ -2731,6 +2738,13 @@ struct ggml_backend_vk_buffer_context {
     }
 
     ~ggml_backend_vk_buffer_context() {
+        if (host_ptr) {
+            vk_device dev = device.lock();
+            for (auto & buf : host_buffers) {
+                ggml_vk_host_unregister(dev, buf->ptr);
+            }
+            host_buffers.clear();
+        }
         ggml_vk_destroy_buffer(dev_buffer);
     }
 };
@@ -3719,6 +3733,7 @@ static vk_buffer ggml_vk_create_buffer(vk_device& device, size_t size, const std
             import_info.setPNext(&mem_flags_info);
             buf->device_memory = device->device.allocateMemory({ size, memory_type_idx, &import_info });
         } catch (const vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: host pointer import failed (%s)\n", e.what());
         }
     } else {
         for (auto it = req_flags_list.begin(); it != req_flags_list.end(); it++) {
@@ -5551,7 +5566,20 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     // Ensure a subgroup size >= 16 is available
     const bool use_subgroups16 = use_subgroups && subgroup_min_size_16;
 
-    const uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control && device->subgroup_min_size <= 16 && device->subgroup_max_size >= 16) ? 16 : device->subgroup_size;
+    // Intel runs the float mul_mat_vec shaders fastest at the native SIMD width, same as the
+    // integer path below. On Xe1 (SIMD8) the old fixed 16 costs about 30% of matvec throughput.
+    // The subgroup16 variants are unaffected, they clamp to 16 through subgroup_size16.
+    uint32_t subgroup_size = (device->vendor_id == VK_VENDOR_ID_INTEL && device->subgroup_size_control) ? device->subgroup_min_size : device->subgroup_size;
+
+    if (device->subgroup_size_control) {
+        const char * mmv_sg = getenv("GGML_VK_MMV_SUBGROUP_SIZE");
+        if (mmv_sg != nullptr) {
+            const uint32_t v = atoi(mmv_sg);
+            if (v >= device->subgroup_min_size && v <= device->subgroup_max_size) {
+                subgroup_size = v;
+            }
+        }
+    }
     const uint32_t subgroup_size16 = std::max(subgroup_size, 16u);
 
     const uint32_t force_subgroup_size = use_subgroups ? subgroup_size : 0;
@@ -8462,6 +8490,24 @@ static vk_pipeline ggml_vk_get_dequantize_mul_mat_vec_id(ggml_backend_vk_context
     return ctx->device->pipeline_dequant_mul_mat_vec_id_f32[dmmv_wg][a_type];
 }
 
+static void ggml_vk_host_register(vk_device& device, vk_buffer& buf) {
+    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
+    device->pinned_memory.push_back(std::make_tuple(buf->ptr, buf->size, buf));
+}
+
+static void ggml_vk_host_unregister(vk_device& device, void * ptr) {
+    if (device == nullptr) {
+        return;
+    }
+    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
+    for (size_t i = 0; i < device->pinned_memory.size(); i++) {
+        if (std::get<0>(device->pinned_memory[i]) == ptr) {
+            device->pinned_memory.erase(device->pinned_memory.begin() + i);
+            return;
+        }
+    }
+}
+
 static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
     VK_LOG_MEMORY("ggml_vk_host_malloc(" << size << ")");
     vk_buffer buf = ggml_vk_create_buffer(device, size,
@@ -8476,8 +8522,7 @@ static void * ggml_vk_host_malloc(vk_device& device, size_t size) {
         return nullptr;
     }
 
-    std::lock_guard<std::shared_mutex> guard(device->pinned_memory_mutex);
-    device->pinned_memory.push_back(std::make_tuple(buf->ptr, size, buf));
+    ggml_vk_host_register(device, buf);
 
     return buf->ptr;
 }
@@ -8514,13 +8559,20 @@ static void ggml_vk_host_get(const vk_device& device, const void * ptr, vk_buffe
     std::shared_lock<std::shared_mutex> guard(device->pinned_memory_mutex);
     buf = nullptr;
     buf_offset = 0;
+    size_t best_room = 0;
     for (size_t i = 0; i < device->pinned_memory.size(); i++) {
         const uint8_t* addr = (const uint8_t*) std::get<0>(device->pinned_memory[i]);
         const uint8_t* endr = addr + std::get<1>(device->pinned_memory[i]);
         if (ptr >= addr && ptr < endr) {
+            // imported host ranges are registered as overlapping chunks, so prefer the
+            // chunk that leaves the most room after ptr to keep large tensors contiguous
+            const size_t room = endr - (const uint8_t *) ptr;
+            if (buf != nullptr && room <= best_room) {
+                continue;
+            }
             buf = std::get<2>(device->pinned_memory[i]);
             buf_offset = ((const uint8_t *)ptr) - addr;
-            break;
+            best_room = room;
         }
     }
 }
@@ -16975,9 +17027,28 @@ static void ggml_backend_vk_buffer_free_buffer(ggml_backend_buffer_t buffer) {
 }
 
 static void * ggml_backend_vk_buffer_get_base(ggml_backend_buffer_t buffer) {
-    return vk_ptr_base;
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
 
-    UNUSED(buffer);
+    // an imported host range must report its real address, the caller allocates tensors inside it
+    return buf_ctx->host_ptr ? buf_ctx->host_ptr : vk_ptr_base;
+}
+
+// tensors in an imported host range hold absolute host addresses, so the target buffer and
+// offset come from the registry instead of being relative to vk_ptr_base
+static void ggml_vk_buffer_tensor_range(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, size_t offset,
+                                        vk_buffer & buf, size_t & buf_offset) {
+    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+
+    // the host buffer type hands out cpu buffers, which have a different context
+    if (ggml_backend_buffer_is_vk(buffer) && buf_ctx->host_ptr) {
+        vk_device device = buf_ctx->device.lock();
+        ggml_vk_host_get(device, (const uint8_t *) tensor->data + offset, buf, buf_offset);
+        GGML_ASSERT(buf != nullptr);
+        return;
+    }
+
+    buf        = buf_ctx->dev_buffer;
+    buf_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
 }
 
 static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
@@ -16990,69 +17061,72 @@ static enum ggml_status ggml_backend_vk_buffer_init_tensor(ggml_backend_buffer_t
 
 static void ggml_backend_vk_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_memset_tensor(" << buffer << ", " << tensor << ", " << value << ", " << offset << ", " << size << ")");
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-    vk_buffer buf = buf_ctx->dev_buffer;
-
     if (size == 0) {
         return;
     }
 
+    vk_buffer buf;
+    size_t buf_offset;
+    ggml_vk_buffer_tensor_range(buffer, tensor, offset, buf, buf_offset);
+
     uint32_t val32 = (uint32_t)value * 0x01010101;
-    ggml_vk_buffer_memset(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, val32, size);
+    ggml_vk_buffer_memset(buf, buf_offset, val32, size);
 }
 
 static void ggml_backend_vk_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-    vk_buffer buf = buf_ctx->dev_buffer;
-
     if (size == 0) {
         return;
     }
 
-    ggml_vk_buffer_write(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    vk_buffer buf;
+    size_t buf_offset;
+    ggml_vk_buffer_tensor_range(buffer, tensor, offset, buf, buf_offset);
+
+    ggml_vk_buffer_write(buf, buf_offset, data, size);
 }
 
 static void ggml_backend_vk_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset,
                                                  size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_set_tensor_2d(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ", " <<
                  n_copies << ", " << stride_tensor << ", " << stride_data << ")");
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-    vk_buffer buf = buf_ctx->dev_buffer;
-
     if (size == 0) {
         return;
     }
 
-    ggml_vk_buffer_write_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_data, stride_tensor, size, n_copies);
+    vk_buffer buf;
+    size_t buf_offset;
+    ggml_vk_buffer_tensor_range(buffer, tensor, offset, buf, buf_offset);
+
+    ggml_vk_buffer_write_2d(buf, buf_offset, data, stride_data, stride_tensor, size, n_copies);
 }
 
 static void ggml_backend_vk_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ")");
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-
     if (size == 0) {
         return;
     }
 
-    vk_buffer buf = buf_ctx->dev_buffer;
+    vk_buffer buf;
+    size_t buf_offset;
+    ggml_vk_buffer_tensor_range(buffer, tensor, offset, buf, buf_offset);
 
-    ggml_vk_buffer_read(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, size);
+    ggml_vk_buffer_read(buf, buf_offset, data, size);
 }
 
 static void ggml_backend_vk_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset,
                                                  size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     VK_LOG_DEBUG("ggml_backend_vk_buffer_get_tensor_2d(" << buffer << ", " << tensor << ", " << data << ", " << offset << ", " << size << ", " <<
                  n_copies << ", " << stride_tensor << ", " << stride_data << ")");
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)buffer->context;
-
     if (size == 0) {
         return;
     }
 
-    vk_buffer buf = buf_ctx->dev_buffer;
+    vk_buffer buf;
+    size_t buf_offset;
+    ggml_vk_buffer_tensor_range(buffer, tensor, offset, buf, buf_offset);
 
-    ggml_vk_buffer_read_2d(buf, vk_tensor_offset(tensor) + tensor->view_offs + offset, data, stride_tensor, stride_data, size, n_copies);
+    ggml_vk_buffer_read_2d(buf, buf_offset, data, stride_tensor, stride_data, size, n_copies);
 }
 
 static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -17061,13 +17135,14 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
     }
 
     if (ggml_backend_buffer_is_vk(src->buffer)) {
-        ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
-        ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
+        vk_buffer src_buf;
+        vk_buffer dst_buf;
+        size_t src_offset;
+        size_t dst_offset;
+        ggml_vk_buffer_tensor_range(src->buffer, src, 0, src_buf, src_offset);
+        ggml_vk_buffer_tensor_range(dst->buffer, dst, 0, dst_buf, dst_offset);
 
-        vk_buffer src_buf = src_buf_ctx->dev_buffer;
-        vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
-
-        ggml_vk_buffer_copy(dst_buf, vk_tensor_offset(dst) + dst->view_offs, src_buf, vk_tensor_offset(src) + src->view_offs, ggml_nbytes(src));
+        ggml_vk_buffer_copy(dst_buf, dst_offset, src_buf, src_offset, ggml_nbytes(src));
 
         return true;
     }
@@ -17078,6 +17153,9 @@ static bool ggml_backend_vk_buffer_cpy_tensor(ggml_backend_buffer_t buffer, cons
 
 static void ggml_backend_vk_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_vk_buffer_context * ctx = (ggml_backend_vk_buffer_context *)buffer->context;
+
+    // imported host ranges are read-only file mappings, writing to them faults
+    GGML_ASSERT(ctx->host_ptr == nullptr);
 
     ggml_vk_buffer_memset(ctx->dev_buffer, 0, value, buffer->size);
 }
@@ -17250,8 +17328,6 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         return;
     }
 
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-
     vk_context cpy_ctx;
 
     if (ctx->device->async_use_transfer_queue) {
@@ -17260,9 +17336,9 @@ static void ggml_backend_vk_set_tensor_2d_async(ggml_backend_t backend, ggml_ten
         cpy_ctx = ggml_vk_get_compute_ctx(ctx);
     }
 
-    vk_buffer buf = buf_ctx->dev_buffer;
-
-    auto dst_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
+    vk_buffer buf;
+    size_t dst_offset;
+    ggml_vk_buffer_tensor_range(tensor->buffer, tensor, offset, buf, dst_offset);
 
     bool ret = ggml_vk_buffer_write_2d_async(cpy_ctx, buf, dst_offset, data, stride_data, stride_tensor, size, n_copies);
 
@@ -17313,13 +17389,12 @@ static void ggml_backend_vk_get_tensor_2d_async(ggml_backend_t backend, const gg
         return;
     }
 
-    ggml_backend_vk_buffer_context * buf_ctx = (ggml_backend_vk_buffer_context *)tensor->buffer->context;
-
     vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-    vk_buffer buf = buf_ctx->dev_buffer;
+    vk_buffer buf;
+    size_t src_offset;
+    ggml_vk_buffer_tensor_range(tensor->buffer, tensor, offset, buf, src_offset);
 
-    auto src_offset = vk_tensor_offset(tensor) + tensor->view_offs + offset;
     bool ret = ggml_vk_buffer_read_2d_async(compute_ctx, buf, src_offset, data, stride_tensor, stride_data, size, n_copies);
 
     if (!ret) {
@@ -17372,22 +17447,23 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
         return false;
     }
 
-    ggml_backend_vk_buffer_context * dst_buf_ctx = (ggml_backend_vk_buffer_context *)dst->buffer->context;
-    vk_buffer dst_buf = dst_buf_ctx->dev_buffer;
+    vk_buffer dst_buf;
+    size_t dst_offset;
+    ggml_vk_buffer_tensor_range(dst->buffer, dst, 0, dst_buf, dst_offset);
 
     if (ggml_backend_buffer_is_vk(src->buffer)) {
-        ggml_backend_vk_buffer_context * src_buf_ctx = (ggml_backend_vk_buffer_context *)src->buffer->context;
+        vk_buffer src_buf;
+        size_t src_offset;
+        ggml_vk_buffer_tensor_range(src->buffer, src, 0, src_buf, src_offset);
 
         // Async copy only works within the same device
-        if (src_buf_ctx->dev_buffer->device != dst_buf->device) {
+        if (src_buf->device != dst_buf->device) {
             return false;
         }
 
         vk_context compute_ctx = ggml_vk_get_compute_ctx(ctx);
 
-        ggml_vk_buffer_copy_async(compute_ctx, dst_buf, vk_tensor_offset(dst) + dst->view_offs,
-                                   src_buf_ctx->dev_buffer, vk_tensor_offset(src) + src->view_offs,
-                                   ggml_nbytes(src));
+        ggml_vk_buffer_copy_async(compute_ctx, dst_buf, dst_offset, src_buf, src_offset, ggml_nbytes(src));
         return true;
     }
 
@@ -17406,9 +17482,7 @@ static bool ggml_backend_vk_cpy_tensor_async(ggml_backend_t backend_src, ggml_ba
             cpy_ctx = ggml_vk_get_compute_ctx(ctx);
         }
 
-        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf,
-                                          vk_tensor_offset(dst) + dst->view_offs,
-                                          src->data, ggml_nbytes(src));
+        return ggml_vk_buffer_write_async(cpy_ctx, dst_buf, dst_offset, src->data, ggml_nbytes(src));
     }
 
     GGML_UNUSED(backend_src);
@@ -19285,6 +19359,31 @@ static std::string ggml_backend_vk_get_device_pci_id(int device_idx) {
     return std::string(pci_bus_id);
 }
 
+// checked without initializing the device, so it must stay in sync with ggml_vk_get_device()
+static bool ggml_backend_vk_device_supports_host_import(int device_idx) {
+    GGML_ASSERT(device_idx >= 0 && device_idx < (int) vk_instance.device_indices.size());
+
+    vk::PhysicalDevice device = vk_instance.instance.enumeratePhysicalDevices()[vk_instance.device_indices[device_idx]];
+
+    vk::PhysicalDeviceProperties2       props        = {};
+    vk::PhysicalDeviceDriverProperties  driver_props = {};
+
+    props.pNext = &driver_props;
+    device.getProperties2(&props);
+
+    if (driver_props.driverID == vk::DriverId::eMoltenvk) {
+        return false;
+    }
+
+    for (const auto & properties : device.enumerateDeviceExtensionProperties()) {
+        if (strcmp("VK_EXT_external_memory_host", properties.extensionName) == 0) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
 //////////////////////////
 
 struct ggml_backend_vk_device_context {
@@ -19292,6 +19391,7 @@ struct ggml_backend_vk_device_context {
     std::string name;
     std::string description;
     bool is_integrated_gpu;
+    bool host_import;
     std::string pci_bus_id;
     int op_offload_min_batch_size;
 };
@@ -19335,12 +19435,17 @@ static void ggml_backend_vk_device_get_props(ggml_backend_dev_t dev, struct ggml
     props->type        = ggml_backend_vk_device_get_type(dev);
     props->device_id   = ctx->pci_bus_id.empty() ? nullptr : ctx->pci_bus_id.c_str();
     ggml_backend_vk_device_get_memory(dev, &props->memory_free, &props->memory_total);
+
+    // an iGPU has no separate VRAM, so mmap-ed weights can be imported and read in place
+    // instead of being copied into a device buffer that lives in the same memory
+    const bool map_weights = ctx->is_integrated_gpu && ctx->host_import;
+
     props->caps = {
         /* .async                 = */ true,
         /* .host_buffer           = */ true,
-        /* .buffer_from_host_ptr  = */ false,
+        /* .buffer_from_host_ptr  = */ map_weights,
         /* .events                = */ true,
-        /* .mmap_support          = */ !ctx->is_integrated_gpu,
+        /* .mmap_support          = */ !ctx->is_integrated_gpu || map_weights,
     };
 }
 
@@ -20112,45 +20217,82 @@ static void ggml_backend_vk_device_event_synchronize(ggml_backend_dev_t dev, ggm
     }
 }
 
-static vk_buffer ggml_vk_buffer_from_host_ptr(vk_device & device, void * ptr, size_t size) {
+// Import a host range as Vulkan buffers. The range is grown to the import alignment and, if it
+// exceeds the maximum buffer size, split into chunks that overlap by max_tensor_size. The overlap
+// guarantees every tensor is fully contained in the chunk that ggml_vk_host_get() picks for it.
+static bool ggml_vk_buffers_from_host_ptr(vk_device & device, void * ptr, size_t size, size_t max_tensor_size,
+                                          std::vector<vk_buffer> & bufs) {
     if (!device->external_memory_host) {
-        return {};
+        return false;
     }
 
-    uintptr_t uptr = reinterpret_cast<uintptr_t>(ptr);
-    if (uptr & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
+    const size_t align = device->min_imported_host_pointer_alignment;
+
+    uint8_t * base = (uint8_t *) ptr;
+    const size_t misalign = (uintptr_t) base & (align - 1);
+    base -= misalign;
+    size  = (size + misalign + align - 1) & ~(align - 1);
+
+    const size_t chunk_max = std::min(device->max_buffer_size, device->max_memory_allocation_size) & ~(align - 1);
+    const size_t overlap   = ((max_tensor_size + align - 1) & ~(align - 1)) + align;
+
+    // a chunk must hold the largest tensor plus a non-empty step, otherwise the range cannot be split
+    if (size > chunk_max && overlap >= chunk_max) {
+        GGML_LOG_DEBUG("ggml_vulkan: largest tensor is too big to import in chunks\n");
+        return false;
     }
-    if (size & (device->min_imported_host_pointer_alignment - 1)) {
-        return {};
-    }
+
+    const size_t step = size <= chunk_max ? size : chunk_max - overlap;
 
     const vk::MemoryPropertyFlags property_flags = vk::MemoryPropertyFlagBits::eHostVisible | vk::MemoryPropertyFlagBits::eHostCoherent | vk::MemoryPropertyFlagBits::eHostCached;
 
-    vk_buffer buf {};
-    try {
-        buf = ggml_vk_create_buffer(device, size, { property_flags }, ptr);
-    } catch (vk::SystemError& e) {
-        GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
+    for (size_t off = 0; off < size; off += step) {
+        const size_t chunk = std::min(chunk_max, size - off);
+
+        vk_buffer buf {};
+        try {
+            buf = ggml_vk_create_buffer(device, chunk, { property_flags }, base + off);
+        } catch (vk::SystemError& e) {
+            GGML_LOG_WARN("ggml_vulkan: Failed ggml_vk_create_buffer (%s)\n", e.what());
+        }
+
+        if (!buf) {
+            bufs.clear();
+            return false;
+        }
+
+        bufs.push_back(buf);
+
+        if (off + chunk == size) {
+            break;
+        }
     }
 
-    return buf;
+    return !bufs.empty();
 }
 
 static ggml_backend_buffer_t ggml_backend_vk_device_buffer_from_host_ptr(ggml_backend_dev_t dev, void * ptr, size_t size, size_t max_tensor_size) {
     VK_LOG_DEBUG("ggml_backend_vk_device_buffer_from_host_ptr(backend=" << dev << ", ptr=" << ptr << ", size=" << size << ")");
-    GGML_UNUSED(max_tensor_size);
 
     ggml_backend_vk_device_context * ctx = (ggml_backend_vk_device_context *)dev->context;
     auto device = ggml_vk_get_device(ctx->device);
 
-    vk_buffer buf = ggml_vk_buffer_from_host_ptr(device, ptr, size);
+    std::vector<vk_buffer> bufs;
 
-    if (!buf) {
+    if (!ggml_vk_buffers_from_host_ptr(device, ptr, size, max_tensor_size, bufs)) {
         return {};
     }
 
-    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(buf), device->name);
+    vk_buffer first = bufs.front();
+    ggml_backend_vk_buffer_context * bufctx = new ggml_backend_vk_buffer_context(device, std::move(first), device->name);
+
+    bufctx->host_ptr     = ptr;
+    bufctx->host_buffers = bufs;
+
+    // the compute paths resolve host addresses through the pinned memory registry
+    for (auto & buf : bufs) {
+        ggml_vk_host_register(device, buf);
+    }
 
     ggml_backend_buffer_t ret = ggml_backend_buffer_init(ggml_backend_vk_device_get_buffer_type(dev), ggml_backend_vk_buffer_interface, bufctx, size);
 
@@ -20203,6 +20345,7 @@ static ggml_backend_dev_t ggml_backend_vk_reg_get_device(ggml_backend_reg_t reg,
                 ctx->name = GGML_VK_NAME + std::to_string(i);
                 ctx->description = desc;
                 ctx->is_integrated_gpu = ggml_backend_vk_get_device_type(i) == vk::PhysicalDeviceType::eIntegratedGpu;
+                ctx->host_import = ggml_backend_vk_device_supports_host_import(i);
                 ctx->pci_bus_id = ggml_backend_vk_get_device_pci_id(i);
                 ctx->op_offload_min_batch_size = min_batch_size;
                 devices.push_back(new ggml_backend_device {
