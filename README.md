@@ -1,46 +1,55 @@
-# llama.cpp
+# llama.cpp_iGPU
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**A fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) focused on integrated GPUs**, where the
+CPU and the GPU share one pool of system memory.
 
-<div align="center">
+This README covers only what is specific to the fork: how to build it, how to run it on an iGPU, and how to
+configure and verify the changes made here. For everything else, including general usage, the other backends,
+the server API and the model list, see upstream:
 
-<b>LLM inference in C/C++</b>
+- [Upstream README](https://github.com/ggml-org/llama.cpp/blob/master/README.md)
+- [Upstream build guide](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)
+- [Upstream server docs](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+- [Upstream Vulkan notes](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md#vulkan)
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+Upstream is MIT licensed and so is this fork. See [LICENSE](LICENSE) and upstream's acknowledgements for the
+vendored third party libraries.
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+---
 
-</div>
+## What is different in this fork
 
-## About this fork
+| Change | Effect |
+|---|---|
+| Weights are imported directly from the mmap-ed model file into Vulkan buffers on an iGPU, rather than copied into a device buffer that lives in the same RAM | Removes one full copy at load time and lowers peak memory. Measured 477 MiB vs 620 MiB peak on a 379 MiB model |
+| The Intel float `mul_mat_vec` shaders run at the native SIMD width instead of a fixed 16 | About 30% faster matvec on Xe1 class hardware. Measured +24% generation on a 26B A4B MoE model |
+| `scripts/gguf_align_check.py` and `scripts/gguf_realign.py` | Check and fix the tensor alignment the import path requires |
+| `GGML_VK_MMV_SUBGROUP_SIZE` environment variable | Override the `mul_mat_vec` subgroup size, since the best value depends on the quantization |
 
-This is a fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) focused on
-integrated GPUs, where the CPU and the GPU share one pool of system memory. Changes on top
-of upstream:
+Backends other than Vulkan are untouched. Within Vulkan, discrete GPUs keep their existing behaviour; the import
+path is gated on the device reporting itself as integrated.
 
-- Weights are imported straight from the mmap-ed model file into Vulkan buffers on an iGPU,
-  instead of being copied into a device buffer that lives in the same RAM. Saves a copy at
-  load time and lowers peak memory.
-- The Intel float `mul_mat_vec` shaders run at the native SIMD width. Worth about 30% of
-  matvec throughput on Xe1 class hardware.
-- `scripts/gguf_align_check.py` and `scripts/gguf_realign.py`, to check and fix the tensor
-  alignment that the import path needs.
+### Reference hardware
 
-Everything below was verified on an Intel Core Ultra 9 285 (Arrow Lake-S, Xe-LPG iGPU),
-64 GB DDR5-5600, Windows 11, Intel driver 32.0.101.8331.
+Every number in this README was measured on:
 
-### Step 1: install the toolchain
+- Intel Core Ultra 9 285 (Arrow Lake-S, 24 CPU cores), integrated Xe GPU, Vulkan device ID `0x7d67`
+- 64 GB DDR5-5600 dual channel, 89.6 GB/s theoretical
+- Windows 11, Intel Vulkan driver 32.0.101.8331, Vulkan 1.4.328
+- 36 GB of system RAM exposed to the GPU by the driver
 
-The Vulkan backend compiles its shaders during the build, so the Vulkan SDK is required and
-not just the headers. On Windows:
+Results on other iGPUs will differ. Lunar Lake and later report a minimum subgroup size of 16 and are
+unaffected by the subgroup change.
+
+---
+
+## Step 1: install the toolchain
+
+The Vulkan backend compiles its compute shaders during the build, so the Vulkan SDK is required, not just the
+headers. CMake and Ninja ship inside the Visual Studio C++ workload, so there is nothing else to install.
 
 ```bat
-:: MSVC, CMake and Ninja (CMake and Ninja ship inside the C++ workload)
+:: MSVC, CMake and Ninja
 winget install --id Microsoft.VisualStudio.BuildTools --accept-package-agreements --accept-source-agreements ^
   --override "--add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --wait --norestart"
 
@@ -48,9 +57,11 @@ winget install --id Microsoft.VisualStudio.BuildTools --accept-package-agreement
 winget install --id KhronosGroup.VulkanSDK --accept-package-agreements --accept-source-agreements
 ```
 
-Both installers need administrator rights, so accept the UAC prompt. If Build Tools is
-already present without the C++ workload, `winget` will try to upgrade it and ignore the
-`--override`. Add the workload to the existing install instead:
+Both installers need administrator rights, so accept the UAC prompt. A dismissed prompt shows up as
+`Installer failed with exit code: 1602`.
+
+If Visual Studio Build Tools is already installed but without the C++ workload, `winget` will try to *upgrade*
+it and silently ignore the `--override`. Add the workload to the existing install instead:
 
 ```bat
 "C:\Program Files (x86)\Microsoft Visual Studio\Installer\setup.exe" modify ^
@@ -58,8 +69,8 @@ already present without the C++ workload, `winget` will try to upgrade it and ig
   --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended --quiet --wait --norestart
 ```
 
-Check that everything is present before continuing. `cl.exe` is not on `PATH` until
-`vcvars64.bat` runs, so look for the files rather than calling them:
+Confirm everything is present. `cl.exe` does not reach `PATH` until `vcvars64.bat` runs, so look for the files
+rather than calling them:
 
 ```bat
 dir "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\VC\Tools\MSVC"
@@ -67,13 +78,15 @@ dir "C:\Program Files (x86)\Microsoft Visual Studio\18\BuildTools\Common7\IDE\Co
 dir "C:\VulkanSDK"
 ```
 
-Version numbers differ between installs. Note the MSVC and Vulkan SDK versions you see,
-they are needed in the next step.
+Note the MSVC and Vulkan SDK version numbers you see. They are needed in the next step.
 
-### Step 2: set up the build environment
+On Linux, install a C++ compiler, CMake, Ninja and the Vulkan SDK through your package manager, then skip to
+step 3. The Vulkan headers alone are not enough; `glslc` must be present.
 
-None of these tools land on `PATH`, and CMake needs `VULKAN_SDK`. Save this as
-`llama-vk-env.bat` outside the repository and adjust the three paths to match your machine:
+## Step 2: set up the build environment
+
+None of these tools land on `PATH`, and CMake needs `VULKAN_SDK` set. Save the following as `llama-vk-env.bat`
+outside the repository, and adjust `REPO`, `BT` and `VULKAN_SDK` to match your machine.
 
 ```bat
 @echo off
@@ -113,52 +126,78 @@ echo ERROR: glslc not found under "%VULKAN_SDK%".
 exit /b 1
 ```
 
-Avoid `if ... (` blocks in this file. A batch file saved with Unix line endings misparses
-them and fails with `) was unexpected at this time`, whereas `goto` labels are parsed one
-line at a time and survive it.
+Two things about this file. Keep the CRLF line endings: a batch file saved with Unix line endings fails with
+`) was unexpected at this time`. And note it uses `goto` labels rather than `if ... (` blocks, because those
+parenthesised blocks are exactly what breaks under Unix line endings.
 
-Use it either as a wrapper for one command or as an interactive shell:
+Use it as a wrapper for a single command, or with no arguments for an interactive shell:
 
 ```bat
 .\llama-vk-env.bat cmake --version
 .\llama-vk-env.bat
 ```
 
-Relative paths in the command you pass are resolved against `%REPO%`, not against the
-directory you started from.
+Relative paths in the command you pass are resolved against `REPO`, not against the directory you ran it from.
+Do not pass `%CD%` in arguments; it is expanded before the script changes directory.
 
-### Step 3: configure and build
+## Step 3: configure and build
 
 ```bat
-llama-vk-env.bat cmake -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DLLAMA_CURL=OFF
-llama-vk-env.bat cmake --build build-vk --target llama-cli llama-bench llama-server -j 24
+.\llama-vk-env.bat cmake -B build-vk -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DLLAMA_CURL=OFF
+.\llama-vk-env.bat cmake --build build-vk --target llama-cli llama-bench llama-server -j 24
 ```
 
-The first build takes several minutes because every Vulkan shader is compiled; later builds
-are incremental. Binaries land in `build-vk\bin\`. Two notes:
+Adjust `-j` to your core count. The first build takes several minutes because every Vulkan shader is compiled;
+later builds are incremental. Binaries land in `build-vk\bin\`.
 
-- `-DLLAMA_CURL=OFF` drops the curl dependency, which also disables `-hf` model downloads.
-  Fetch GGUF files yourself, or leave it on if you have curl.
-- Linking fails with `LNK1104: cannot open file 'bin\ggml-vulkan.dll'` if a llama.cpp
-  process is still running. Stop it and build again.
+A successful configure prints lines like these:
 
-### Step 4: confirm the iGPU is detected
+```
+-- Found Vulkan: C:/VulkanSDK/1.4.357.0/Lib/vulkan-1.lib (found version "1.4.357") found components: glslc glslangValidator
+-- Vulkan found
+-- Including Vulkan backend
+```
+
+Notes:
+
+- `-DLLAMA_CURL=OFF` drops the curl dependency, which also disables `-hf` model downloads. Leave it on if you
+  have curl and want to pull models from Hugging Face directly.
+- Add `-DLLAMA_BUILD_TESTS=ON` if you want `test-backend-ops`, used in step 7 and step 8.
+- Linking fails with `LNK1104: cannot open file 'bin\ggml-vulkan.dll'` if a llama.cpp process is still running.
+  Stop it and build again.
+
+## Step 4: confirm the iGPU is detected
 
 ```bat
 build-vk\bin\llama-cli.exe --list-devices
 ```
 
-Expected output names the integrated GPU, for example:
+Expected output names the integrated GPU:
 
 ```
 Available devices:
   Vulkan0: Intel(R) Graphics (36974 MiB, 47715 MiB free)
 ```
 
-The reported total is the share of system RAM the driver exposes to the GPU, not a fixed
-VRAM size. On some drivers the free figure exceeds the total; that is a driver quirk.
+The total is the share of system RAM the driver exposes to the GPU, not a fixed VRAM size. On some drivers the
+free figure exceeds the total; that is a driver reporting quirk, not a problem.
 
-### Step 5: run a model
+To see the capabilities the backend detected:
+
+```bat
+set GGML_VK_DEBUG=1
+build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 99 -p 0 -n 1 -r 1
+```
+
+```
+ggml_vulkan: 0 = Intel(R) Graphics (Intel Corporation) | uma: 1 | fp16: 1 | bf16: 0 | fp4: 0 | warp size: 32 | shared memory: 32768 | int dot: 1 | matrix cores: none
+```
+
+`uma: 1` is what enables the shared memory paths in this fork. `matrix cores: none` means the driver exposes no
+`VK_KHR_cooperative_matrix`, which is the case on this hardware and cannot be changed by configuration. Check
+with `vulkaninfo | findstr cooperative_matrix` if you want to confirm it on your own device.
+
+## Step 5: run a model
 
 ```bat
 :: interactive chat, all layers on the iGPU
@@ -171,52 +210,68 @@ build-vk\bin\llama-cli.exe -m models\model.gguf -ngl 99 -p "Name three primary c
 build-vk\bin\llama-server.exe -m models\model.gguf -ngl 99 -c 8192 --host 127.0.0.1 --port 8080
 ```
 
-Useful flags on an iGPU:
+Flags that matter on an iGPU:
 
-| flag | purpose |
+| Flag | Purpose |
 |---|---|
 | `-ngl N` | layers on the GPU. `-ngl 0` keeps everything on the CPU |
 | `-c N` | context length |
-| `-t N` | CPU threads for any layers left on the CPU |
+| `-t N` | CPU threads, for any layers left on the CPU |
 | `-b N` / `-ub N` | logical and physical batch size |
-| `--load-mode mmap` | map the weights. Add `mmap+mlock` to also lock them in RAM |
+| `--load-mode mmap` | map the weights, which is what the import path needs |
+| `--load-mode mmap+mlock` | map and lock them in RAM |
 | `--load-mode none` | read weights into a device buffer, disabling the import path |
 | `-ncmoe N` | keep the expert weights of N layers on the CPU, for MoE models |
 | `-ot "<regex>=CPU"` | pin matching tensors to the CPU, e.g. `-ot "token_embd\.weight=CPU"` |
 
-`-kvu`, `-np` and other server options are rejected by `llama-cli`; they only apply to
-`llama-server`, `llama-bench` and the other examples that register them. Reasoning models
-need a generous `-n`, otherwise the whole budget goes into the thinking block.
+Use `--load-mode mmap+mlock` rather than combining `--load-mode mmap` with `--mlock`. Both write the same
+setting, so passing them separately silently loses one.
 
-### Step 6: decide between the iGPU and the CPU
+`-kvu`, `-np` and several other options are rejected by `llama-cli` with `invalid argument`; they are registered
+only for `llama-server`, `llama-bench` and other examples. Reasoning models need a generous `-n`, otherwise the
+whole token budget is consumed by the thinking block.
 
-On a shared memory system the CPU and the iGPU compete for the same bandwidth, and which
-one wins depends on the workload. Measure instead of guessing:
+## Step 6: choose between the iGPU and the CPU
+
+On a shared memory system both engines draw on the same bandwidth, and which one wins depends on the workload.
+Measure rather than assume:
 
 ```bat
-llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 99 -t 9 -r 3
-llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 0  -t 24 -r 3
+.\llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 99 -t 9  -r 3
+.\llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 0  -t 24 -r 3
 ```
 
-On the reference machine, with a 26B A4B MoE model at Q4_0, the iGPU is clearly better at
-prompt processing and clearly worse at generation:
+On the reference machine with a 26B A4B MoE model at Q4_0, 30 layers:
 
-| configuration | prompt (t/s) | generation (t/s) |
+| Configuration | Prompt (t/s) | Generation (t/s) |
 |---|---|---|
-| `-ngl 30 -t 9` (all layers on the iGPU) | 133.0 | 11.0 |
-| `-ngl 0 -t 24` (CPU only) | 78.8 | 24.6 |
-| `-ngl 30 -ncmoe 30 -t 9` (experts on the CPU) | 90.9 | 10.0 |
+| `-ngl 30 -t 9`, all layers on the iGPU | **133.0** | 11.0 |
+| `-ngl 0 -t 24`, CPU only | 78.8 | **24.6** |
+| `-ngl 30 -ncmoe 30 -t 9`, experts on the CPU | 90.9 | 10.0 |
+| `-ngl 30 -ncmoe 30 -t 24` | 84.7 | 10.7 |
 
-Forcing experts onto the CPU with `-ncmoe` only pays off when the weights do not fit in the
-memory the driver exposes to the GPU. Here they did fit, so it lost 32% of prompt throughput
-and gained nothing.
+The iGPU is 69% faster at prompt processing and the CPU is 2.2x faster at generation, so pick per workload:
+the iGPU for long prompts, RAG and code review, the CPU for chat.
 
-### Step 7: zero-copy weight loading
+`-ncmoe` is a technique for when weights do not fit in the memory the driver exposes to the GPU. Here they did
+fit, so forcing experts onto the CPU cost 32% of prompt throughput and gained nothing. Only reach for it if the
+model does not otherwise fit.
 
-On an iGPU this fork imports the mmap-ed file directly, which needs every tensor offset to
-be a multiple of the Vulkan `minStorageBufferOffsetAlignment`, commonly 64. GGUF pads tensor
-data to `general.alignment`, 32 by default, so many published models do not qualify. When
-that happens the import is skipped and loading falls back to the copy path, with no error.
+Generation on this class of hardware is memory bandwidth bound, so more CPU threads help very little: 22.7 t/s
+at 9 threads against 24.6 t/s at 24.
+
+## Step 7: zero-copy weight loading
+
+On an iGPU this fork imports the mmap-ed file directly as Vulkan buffers, using
+`VK_EXT_external_memory_host`. Ranges larger than the device `maxBufferSize`, commonly 4 GiB, are imported as
+overlapping chunks.
+
+### The alignment requirement
+
+Every tensor offset must be a multiple of the Vulkan `minStorageBufferOffsetAlignment`, which is 64 on the
+reference hardware. GGUF pads tensor data to `general.alignment`, 32 by default, so **many published models do
+not qualify**. When a model does not qualify the import is skipped and loading falls back to the copy path,
+with no error and no log line.
 
 Check a model before running it:
 
@@ -224,150 +279,119 @@ Check a model before running it:
 python scripts\gguf_align_check.py models\model.gguf 64
 ```
 
-Rewrite one that does not qualify. Tensor payloads are copied unchanged, only the padding
-and the offsets differ:
+```
+tensors         : 658
+general.alignment: 32
+misaligned      : 325 of 658
+
+zero-copy import will NOT engage. First offenders:
+  blk.0.post_attention_norm.weight   offset 1064755744 (mod 64 = 32)
+  ...
+```
+
+Rewrite a model that does not qualify. Tensor payloads are copied unchanged; only the padding and the offsets
+differ, and the file size is effectively identical:
 
 ```bat
 python scripts\gguf_realign.py models\model.gguf models\model-a64.gguf 64
+python scripts\gguf_align_check.py models\model-a64.gguf 64
 ```
 
-Both scripts read the GGUF header directly and need no `numpy` or `gguf-py`.
+Both scripts parse the GGUF header directly and need no `numpy` or `gguf-py`.
 
-There is no log line announcing the import. Confirm it by running with `-v` and checking
-that the load mode is `mmap` and that no `host pointer import failed` warning appears, or by
-comparing peak memory against `--load-mode none`. On the reference machine a 379 MiB model
-peaked at 477 MiB with the import against 620 MiB without it.
+### Confirming the import engaged
 
-### Step 8: tuning knob
+There is no dedicated log line. Use any of these:
 
-`GGML_VK_MMV_SUBGROUP_SIZE` overrides the subgroup size of the `mul_mat_vec` shaders. The
-fork already defaults to the native SIMD width, which is the best value for most types, but
-the optimum depends on the quantization:
+1. Run with `-v` and check the load mode is `mmap`. Without this fork an iGPU forces `none`.
+2. Run with `-v` and check that no `ggml_vulkan: host pointer import failed` warning appears. A failed import
+   aborts the load outright, so a model that loads at all took the path.
+3. Compare peak memory against `--load-mode none`. On the reference machine a 379 MiB model peaked at 477 MiB
+   with the import and 620 MiB without.
+
+To disable the path entirely, pass `--load-mode none`.
+
+### Note on mmap semantics
+
+Importing requires a copy-on-write mapping, because drivers reject importing read-only pages. This fork maps
+the file copy-on-write only when a device reports itself as an integrated GPU and supports host pointer import.
+Metal, CUDA, CPU and BLAS keep read-only mappings.
+
+## Step 8: tuning
+
+### mul_mat_vec subgroup size
+
+`GGML_VK_MMV_SUBGROUP_SIZE` overrides the subgroup size of the `mul_mat_vec` shaders. The fork already defaults
+to the native SIMD width, which is the best value for most quantizations, but the optimum varies:
 
 ```bat
 set GGML_VK_MMV_SUBGROUP_SIZE=32
-llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 99 -r 3
+.\llama-vk-env.bat build-vk\bin\llama-bench.exe -m models\model.gguf -ngl 99 -r 3
 ```
 
-Measured per kernel on the reference iGPU, time for one `m=4096 n=1 k=14336` matvec:
+Time for one `m=4096 n=1 k=14336` matvec on the reference iGPU, lower is better:
 
-| type | subgroup 8 | subgroup 16 | subgroup 32 |
+| Type | subgroup 8 (default here) | subgroup 16 (upstream) | subgroup 32 |
 |---|---|---|---|
-| q4_0 | 685 us | 991 us | 783 us |
-| q4_K | 989 us | 996 us | 862 us |
-| q6_K | 1411 us | 1412 us | 2190 us |
+| q4_0 | **685 us** | 991 us | 783 us |
+| q4_K | 989 us | 996 us | **862 us** |
+| q6_K | **1411 us** | 1412 us | 2190 us |
+| f16 | 1654 us | 1622 us | 1626 us |
 
-Whole model benchmarks on this hardware carry about 13% run to run variance, enough to hide
-an effect this size. To measure a single kernel instead, which is far more stable, use:
+f16 is unaffected because it is bandwidth bound rather than dequantization bound, which is why it makes a good
+control when testing.
+
+### Measuring reliably
+
+Whole model benchmarks on this hardware carry about 13% run to run variance, enough to hide an effect of this
+size. Measure a single kernel instead:
 
 ```bat
 build-vk\bin\test-backend-ops.exe perf -b Vulkan0 -o MUL_MAT -p "type_a=q4_0,type_b=f32,m=4096,n=1,k=14336"
 ```
 
-## Quick start
+That repeats one kernel about 1700 times and is stable to roughly 1 us. Requires
+`-DLLAMA_BUILD_TESTS=ON` at configure time.
 
-A few options to get `llama.cpp` installed on your machine:
+### Why quantized matvec is the bottleneck
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+For context on where the remaining headroom is: the reference iGPU reaches 69.8 GB/s on f16 matvec, 78% of the
+89.6 GB/s theoretical peak and above what the CPU achieves. The quantized kernels reach only 26 to 33 GB/s
+because they are dequantization ALU bound, not bandwidth bound. Time per kernel is nearly independent of bytes
+read, which is the giveaway. The subgroup change above lifts q4_0 from 33 GB/s to 48 GB/s; closing the rest
+would need shader work rather than parameter tuning.
 
-Once installed:
+## Step 9: verify a build
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+Correctness against the CPU backend:
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+```bat
+build-vk\bin\test-backend-ops.exe test -b Vulkan0 -o MUL_MAT
+build-vk\bin\test-backend-ops.exe test -b Vulkan0 -o MUL_MAT_ID
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Both should report all tests passed. The full suite, `test-backend-ops test -b Vulkan0`, takes upwards of
+15 minutes and occasionally reports a marginal `iq2_xxs` failure at roughly 0.0008 against a 0.0005 tolerance.
+That is non-reproducible driver level numerical noise, present on unmodified upstream as well.
 
-## Description
+## Staying in sync with upstream
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+```bat
+git remote add upstream https://github.com/ggml-org/llama.cpp.git
+git fetch upstream
+git rebase upstream/master
+```
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+Rebuild and re-run step 9 afterwards. Upstream changes the Vulkan backend often, so a clean rebase is not by
+itself evidence that the fork's changes still behave.
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## Files changed by this fork
 
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+| File | Change |
+|---|---|
+| `ggml/src/ggml-vulkan/ggml-vulkan.cpp` | host pointer import, chunking, registry integration, subgroup size, import error reporting |
+| `src/llama-model.cpp` | alignment gate, copy-on-write mapping decision |
+| `src/llama-model-loader.cpp` / `.h` | `mapping_is_aligned`, writable mapping flag |
+| `src/llama-mmap.cpp` / `.h` | copy-on-write mapping support |
+| `scripts/gguf_align_check.py` | report whether a GGUF meets a given tensor alignment |
+| `scripts/gguf_realign.py` | rewrite a GGUF with a larger tensor alignment |
