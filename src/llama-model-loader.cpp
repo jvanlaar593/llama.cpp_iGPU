@@ -1400,7 +1400,7 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
-void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps, bool writable) {
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1422,7 +1422,7 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             const size_t prefetch_size = prefetch && use_mmap ? -1 : 0;
 
             std::unique_ptr<llama_mmap> mapping = std::make_unique<llama_mmap>(file.get(), prefetch_size, is_numa,
-                    lazy.for_file(idx));
+                    lazy.for_file(idx), writable);
             mmaps_used.emplace_back(mapping->size(), 0);
             if (mlock_mmaps) {
                 std::unique_ptr<llama_mlock> mlock_mmap(new llama_mlock());
@@ -1454,6 +1454,25 @@ void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void *
         *first = std::min(*first, weight->offs);
         *last  = std::max(*last,  weight->offs + ggml_nbytes(tensor));
     }
+}
+
+bool llama_model_loader::mapping_is_aligned(size_t alignment, int idx, ggml_context * ctx) const {
+    if (alignment <= 1) {
+        return true;
+    }
+
+    // the mapping starts on a page boundary, so only the offsets inside the file can break alignment
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor; tensor = ggml_get_next_tensor(ctx, tensor)) {
+        const auto * weight = get_weight(ggml_get_name(tensor));
+        if (!weight || weight->idx != idx) {
+            continue;
+        }
+        if (weight->offs & (alignment - 1)) {
+            return false;
+        }
+    }
+
+    return true;
 }
 
 void llama_model_loader::unmap_weight(const llama_tensor_weight & w) const {
